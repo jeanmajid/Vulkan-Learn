@@ -1,0 +1,29 @@
+{
+    "version": 2,
+    "configurePresets": [
+        {
+            "name": "default",
+            "generator": "Ninja Multi-Config",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "gcc",
+                "CMAKE_CXX_COMPILER": "g++",
+                "CMAKE_CXX_FLAGS_RELEASE": "-DNDEBUG -O3 -march=native -flto"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "debug",
+            "configurePreset": "default",
+            "configuration": "Debug",
+            "jobs": 0
+        },
+        {
+            "name": "release",
+            "configurePreset": "default",
+            "configuration": "Release",
+            "jobs": 0
+        }
+    ]
+}
