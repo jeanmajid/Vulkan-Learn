@@ -4,15 +4,19 @@
 #include <map>
 #include <limits>
 #include <algorithm>
+#include <fstream>
 
 #define VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
 #include <vulkan/vulkan_raii.hpp>
 
 #define GLFW_INCLUDE_VULKAN
+#include <chrono>
 #include <GLFW/glfw3.h>
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
+
+constexpr int MAX_FRAMES_IN_FLIGHT = 2;
 
 const std::vector<char const *> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
@@ -23,6 +27,22 @@ constexpr bool enableValidationLayers = false;
 #else
 constexpr bool enableValidationLayers = true;
 #endif
+
+static std::vector<char> readFile(const std::string &filepath) {
+    std::ifstream file(filepath, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open file");
+    }
+
+    std::vector<char> buffer(file.tellg());
+
+    file.seekg(0, std::ios::beg);
+    file.read(buffer.data(), buffer.size());
+
+    file.close();
+    return buffer;
+}
 
 class HelloTriangleApp {
 public:
@@ -40,6 +60,7 @@ private:
     vk::raii::Instance instance = nullptr;
     vk::raii::PhysicalDevice physicalDevice = nullptr;
     vk::raii::Device device = nullptr;
+    uint32_t queueIndex = ~0;
     vk::raii::Queue queue = nullptr;
     vk::raii::SurfaceKHR surface = nullptr;
     vk::raii::SwapchainKHR swapChain = nullptr;
@@ -47,6 +68,14 @@ private:
     vk::SurfaceFormatKHR swapChainSurfaceFormat;
     vk::Extent2D swapChainExtent;
     std::vector<vk::raii::ImageView> swapChainImageViews;
+    vk::raii::PipelineLayout pipelineLayout = nullptr;
+    vk::raii::Pipeline graphicsPipeline = nullptr;
+    vk::raii::CommandPool commandPool = nullptr;
+    std::vector<vk::raii::CommandBuffer> commandBuffers;
+    std::vector<vk::raii::Semaphore> presentCompleteSemaphores;
+    std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
+    std::vector<vk::raii::Fence> inFlightFences;
+    uint32_t frameIndex = 0;
 
     void initWindow() {
         glfwInit();
@@ -64,12 +93,19 @@ private:
         createLogicalDevice();
         createSwapChain();
         createImageViews();
+        createGraphicsPipeline();
+        createCommandPool();
+        createCommandBuffers();
+        createSyncObjects();
     }
 
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+            drawFrame();
         }
+
+        device.waitIdle();
     }
 
     void cleanup() {
@@ -174,7 +210,6 @@ private:
     void createLogicalDevice() {
         std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
 
-        uint32_t queueIndex = ~0;
         for (uint32_t qfpIndex = 0; qfpIndex < queueFamilyProperties.size(); qfpIndex++) {
             if (queueFamilyProperties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics &&
                 physicalDevice.getSurfaceSupportKHR(qfpIndex, *surface)) {
@@ -187,10 +222,12 @@ private:
         }
 
         // Create a chain of feature structures
-        vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features,
+        vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
+            vk::PhysicalDeviceVulkan13Features,
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> featureChain = {
             {}, // vk::PhysicalDeviceFeatures2 (empty for now)
-            {.dynamicRendering = true}, // Enable dynamic rendering from Vulkan 1.3
+            {.shaderDrawParameters = true},
+            {.synchronization2 = true, .dynamicRendering = true}, // Enable dynamic rendering from Vulkan 1.3
             {.extendedDynamicState = true} // Enable extended dynamic state from the extension
         };
 
@@ -243,7 +280,7 @@ private:
             .imageSharingMode = vk::SharingMode::eExclusive,
             .preTransform = surfaceCapabilities.currentTransform,
             .compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque,
-            .presentMode = chooseSwapPresentMode(physicalDevice.getSurfacePresentModesKHR(*surface)),
+            .presentMode = chooseSwapPresentMode(availablePresentModes),
             .clipped = true,
             .oldSwapchain = nullptr
         };
@@ -269,6 +306,7 @@ private:
                 return availablePresentMode;
             }
         }
+        // eFifo is Vsync, Mailbox renders everything throwing old frames away, resulting in 100% gpu usage
         return vk::PresentModeKHR::eFifo;
     }
 
@@ -294,10 +332,281 @@ private:
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
         };
 
-        for (const auto image : swapChainImages) {
+        for (const auto image: swapChainImages) {
             imageViewCreateInfo.image = image;
             swapChainImageViews.emplace_back(device, imageViewCreateInfo);
         }
+    }
+
+    void createGraphicsPipeline() {
+        vk::raii::ShaderModule shaderModule = createShaderModule(readFile("../../shaders/slang.spv"));
+
+        vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
+            .stage = vk::ShaderStageFlagBits::eVertex,
+            .module = shaderModule,
+            .pName = "vertMain"
+        };
+
+        vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
+            .stage = vk::ShaderStageFlagBits::eFragment,
+            .module = shaderModule,
+            .pName = "fragMain"
+        };
+
+        vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
+
+        vk::PipelineVertexInputStateCreateInfo vertexInputInfo;
+
+        vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+            .topology = vk::PrimitiveTopology::eTriangleList
+        };
+
+        vk::PipelineViewportStateCreateInfo viewportState{
+            .viewportCount = 1,
+            .scissorCount = 1
+        };
+
+        vk::PipelineRasterizationStateCreateInfo rasterizer{
+            .depthClampEnable = vk::False,
+            .rasterizerDiscardEnable = vk::False,
+            .polygonMode = vk::PolygonMode::eFill,
+            .cullMode = vk::CullModeFlagBits::eBack,
+            .frontFace = vk::FrontFace::eClockwise,
+            .depthBiasEnable = vk::False,
+            .depthBiasSlopeFactor = 1.0f,
+            .lineWidth = 1.0f
+        };
+
+        vk::PipelineMultisampleStateCreateInfo multisampling{
+            .rasterizationSamples = vk::SampleCountFlagBits::e1,
+            .sampleShadingEnable = vk::False
+        };
+
+        vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+            .blendEnable = vk::False,
+            .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+        };
+
+        vk::PipelineColorBlendStateCreateInfo colorBlending{
+            .logicOpEnable = vk::False,
+            .logicOp = vk::LogicOp::eCopy,
+            .attachmentCount = 1,
+            .pAttachments = &colorBlendAttachment
+        };
+
+        std::vector dynamicStates = {
+            vk::DynamicState::eViewport,
+            vk::DynamicState::eScissor
+        };
+
+        vk::PipelineDynamicStateCreateInfo dynamicState{
+            .dynamicStateCount = static_cast<uint32_t>(dynamicStates.size()),
+            .pDynamicStates = dynamicStates.data()
+        };
+
+        vk::PipelineLayoutCreateInfo pipelineLayoutInfo{
+            .setLayoutCount = 0,
+            .pushConstantRangeCount = 0
+        };
+
+        pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
+
+        vk::PipelineRenderingCreateInfo pipelineRenderingCreateInfo{
+            .colorAttachmentCount = 1, .pColorAttachmentFormats = &swapChainSurfaceFormat.format
+        };
+
+        vk::GraphicsPipelineCreateInfo pipelineInfo{
+            .pNext = &pipelineRenderingCreateInfo,
+            .stageCount = 2,
+            .pStages = shaderStages,
+            .pVertexInputState = &vertexInputInfo,
+            .pInputAssemblyState = &inputAssembly,
+            .pViewportState = &viewportState,
+            .pRasterizationState = &rasterizer,
+            .pMultisampleState = &multisampling,
+            .pColorBlendState = &colorBlending,
+            .pDynamicState = &dynamicState,
+            .layout = pipelineLayout,
+            .renderPass = nullptr
+        };
+
+        graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineInfo);
+    }
+
+    [[nodiscard]] vk::raii::ShaderModule createShaderModule(const std::vector<char> &code) {
+        vk::ShaderModuleCreateInfo createInfo{
+            .codeSize = code.size() * sizeof(char),
+            .pCode = reinterpret_cast<const uint32_t *>(code.data())
+        };
+
+        vk::raii::ShaderModule shaderModule{device, createInfo};
+        return shaderModule;
+    }
+
+    void createCommandPool() {
+        vk::CommandPoolCreateInfo poolInfo{
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = queueIndex
+        };
+
+        commandPool = vk::raii::CommandPool(device, poolInfo);
+    }
+
+    void createCommandBuffers() {
+        commandBuffers.clear();
+        vk::CommandBufferAllocateInfo allocInfo{
+            .commandPool = commandPool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = MAX_FRAMES_IN_FLIGHT
+        };
+        commandBuffers = std::move(vk::raii::CommandBuffers(device, allocInfo));
+    }
+
+    void recordCommandBuffer(uint32_t imageIndex) {
+        const auto &commandBuffer = commandBuffers[frameIndex];
+        commandBuffer.begin({});
+
+        // Before starting rendering, transition the swapchain image to COLOR_ATTACHMENT_OPTIMAL
+        transition_image_layout(
+            imageIndex,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            {}, // srcAccessMask (no need to wait for previous operations)
+            vk::AccessFlagBits2::eColorAttachmentWrite, // dstAccessMask
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput, // srcStage
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput // dstStage
+        );
+
+        vk::ClearValue clearColor = vk::ClearColorValue(0.0f, 0.0f, 0.0f, 1.0f);
+        vk::RenderingAttachmentInfo attachmentInfo = {
+            .imageView = swapChainImageViews[imageIndex],
+            .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .loadOp = vk::AttachmentLoadOp::eClear,
+            .storeOp = vk::AttachmentStoreOp::eStore,
+            .clearValue = clearColor
+        };
+
+        vk::RenderingInfo renderingInfo = {
+            .renderArea = {.offset = {0, 0}, .extent = swapChainExtent},
+            .layerCount = 1,
+            .colorAttachmentCount = 1,
+            .pColorAttachments = &attachmentInfo
+        };
+
+        commandBuffer.beginRendering(renderingInfo);
+
+        commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphicsPipeline);
+        commandBuffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(swapChainExtent.width),
+                                                  static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
+        commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
+
+        commandBuffer.draw(3, 1, 0, 0);
+
+        commandBuffer.endRendering();
+
+        // After rendering, transition the swapchain image to PRESENT_SRC
+        transition_image_layout(
+            imageIndex,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::ImageLayout::ePresentSrcKHR,
+            vk::AccessFlagBits2::eColorAttachmentWrite, // srcAccessMask
+            {}, // dstAccessMask
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput, // srcStage
+            vk::PipelineStageFlagBits2::eBottomOfPipe // dstStage
+        );
+
+        commandBuffer.end();
+    }
+
+    void transition_image_layout(
+        uint32_t imageIndex,
+        vk::ImageLayout oldLayout,
+        vk::ImageLayout newLayout,
+        vk::AccessFlags2 srcAccessMask,
+        vk::AccessFlags2 dstAccessMask,
+        vk::PipelineStageFlags2 srcStageMask,
+        vk::PipelineStageFlags2 dstStageMask
+    ) {
+        vk::ImageMemoryBarrier2 barrier = {
+            .srcStageMask = srcStageMask,
+            .srcAccessMask = srcAccessMask,
+            .dstStageMask = dstStageMask,
+            .dstAccessMask = dstAccessMask,
+            .oldLayout = oldLayout,
+            .newLayout = newLayout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = swapChainImages[imageIndex],
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+        vk::DependencyInfo dependencyInfo = {
+            .dependencyFlags = {},
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &barrier
+        };
+        commandBuffers[frameIndex].pipelineBarrier2(dependencyInfo);
+    }
+
+    void createSyncObjects() {
+        assert(presentCompleteSemaphores.empty() && renderFinishedSemaphores.empty() && inFlightFences.empty());
+
+        for (size_t i = 0; i < swapChainImages.size(); i++)
+        {
+            renderFinishedSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+        }
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+        {
+            presentCompleteSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+            inFlightFences.emplace_back(device, vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled});
+        }
+    }
+
+    void drawFrame() {
+        auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
+        if (fenceResult != vk::Result::eSuccess)
+        {
+            throw std::runtime_error("failed to wait for fence!");
+        }
+        device.resetFences(*inFlightFences[frameIndex]);
+
+        auto [result, imageIndex] = swapChain.acquireNextImage(
+            UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+
+        recordCommandBuffer(imageIndex);
+
+
+        vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
+        const vk::SubmitInfo submitInfo{
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &*presentCompleteSemaphores[frameIndex],
+            .pWaitDstStageMask = &waitDestinationStageMask,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &*commandBuffers[frameIndex],
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &*renderFinishedSemaphores[imageIndex]
+        };
+
+        queue.submit(submitInfo, *inFlightFences[frameIndex]);
+
+        const vk::PresentInfoKHR presentInfoKHR{
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &*renderFinishedSemaphores[imageIndex],
+            .swapchainCount = 1,
+            .pSwapchains = &*swapChain,
+            .pImageIndices = &imageIndex
+        };
+
+        result = queue.presentKHR(presentInfoKHR);
+
+        frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 };
 
