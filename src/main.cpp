@@ -7,6 +7,7 @@
 #include <fstream>
 
 #define VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
+#define VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS
 #include <vulkan/vulkan_raii.hpp>
 
 #define GLFW_INCLUDE_VULKAN
@@ -76,14 +77,22 @@ private:
     std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
     std::vector<vk::raii::Fence> inFlightFences;
     uint32_t frameIndex = 0;
+    bool framebufferResized = false;
 
     void initWindow() {
         glfwInit();
 
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+        // glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
-        window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan Learn", nullptr, nullptr);
+        window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+        glfwSetWindowUserPointer(window, this);
+        glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+    }
+
+    static void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
+        const auto app = static_cast<HelloTriangleApp*>(glfwGetWindowUserPointer(window));
+        app->framebufferResized = true;
     }
 
     void initVulkan() {
@@ -109,6 +118,8 @@ private:
     }
 
     void cleanup() {
+        cleanupSwapChain();
+
         glfwDestroyWindow(window);
         glfwTerminate();
     }
@@ -255,9 +266,9 @@ private:
     }
 
     void createSwapChain() {
-        auto surfaceCapabilities = physicalDevice.getSurfaceCapabilitiesKHR(surface);
-        auto availableFormats = physicalDevice.getSurfaceFormatsKHR(surface);
-        auto availablePresentModes = physicalDevice.getSurfacePresentModesKHR(surface);
+        auto surfaceCapabilities = physicalDevice.getSurfaceCapabilitiesKHR(*surface);
+        auto availableFormats = physicalDevice.getSurfaceFormatsKHR(*surface);
+        auto availablePresentModes = physicalDevice.getSurfacePresentModesKHR(*surface);
 
         swapChainSurfaceFormat = chooseSwapSurfaceFormat(availableFormats);
         swapChainExtent = chooseSwapExtent(surfaceCapabilities);
@@ -321,6 +332,26 @@ private:
             std::clamp<uint32_t>(width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width),
             std::clamp<uint32_t>(height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height)
         };
+    }
+
+    void cleanupSwapChain() {
+        swapChainImageViews.clear();
+        swapChain = nullptr;
+    }
+
+    void recreateSwapChain() {
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        while (width == 0 || height == 0) {
+            glfwGetFramebufferSize(window, &width, &height);
+            glfwWaitEvents();
+        }
+
+        device.waitIdle();
+
+        cleanupSwapChain();
+        createSwapChain();
+        createImageViews();
     }
 
     void createImageViews() {
@@ -575,13 +606,18 @@ private:
         {
             throw std::runtime_error("failed to wait for fence!");
         }
-        device.resetFences(*inFlightFences[frameIndex]);
 
         auto [result, imageIndex] = swapChain.acquireNextImage(
             UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+        if (result == vk::Result::eErrorOutOfDateKHR) {
+            recreateSwapChain();
+            return;
+        }
 
+        device.resetFences(*inFlightFences[frameIndex]);
+
+        commandBuffers[frameIndex].reset();
         recordCommandBuffer(imageIndex);
-
 
         vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
         const vk::SubmitInfo submitInfo{
@@ -605,6 +641,11 @@ private:
         };
 
         result = queue.presentKHR(presentInfoKHR);
+        if (result == vk::Result::eSuboptimalKHR || result == vk::Result::eErrorOutOfDateKHR || framebufferResized)
+        {
+            framebufferResized = false;
+            recreateSwapChain();
+        }
 
         frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
     }
